@@ -3,13 +3,18 @@ import numpy as np
 import joblib
 import matplotlib
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import (
+    train_test_split,
+    cross_val_score,
+    RandomizedSearchCV,
+    KFold,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, r2_score
 
 data = pd.read_csv("Life Expectancy Data.csv").drop(columns=["Unnamed: 0"])
 
@@ -21,48 +26,89 @@ for col in data.columns:
 data.columns = clean_columns
 
 # Drop rows with no life expectancy
-data = data[~data["Life expectancy"].isna()]
+data = data.dropna(subset=["Life expectancy"]).copy()
 
 # Split data
-X = data.drop(columns =["Life expectancy"])
+X = data.drop(columns=["Life expectancy"])
 y = data["Life expectancy"]
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=1)
 
-# Fix missing values
-categorical_cols = ["Country", "Status"]
-numerical_cols = list(X_train.drop(columns= categorical_cols).columns)
+# Split columns
+num_cols = X_train.select_dtypes(include=["number"]).columns.tolist()
+cat_cols = X_train.select_dtypes(
+    include=["object", "string", "category"]
+).columns.tolist()
 
-# For numerical
-num_imputer = SimpleImputer(strategy="mean")
-X_train[numerical_cols] = num_imputer.fit_transform(X_train[numerical_cols])
-X_test[numerical_cols] = num_imputer.transform(X_test[numerical_cols])
+# Build preprocessor for pipeline
+num_transformer = Pipeline(
+    [("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
+)
 
-# For categorical
-cat_imputer = SimpleImputer(strategy="most_frequent")
-X_train[categorical_cols] = cat_imputer.fit_transform(X_train[categorical_cols])
-X_test[categorical_cols] = cat_imputer.transform(X_test[categorical_cols])
+cat_transformer = Pipeline(
+    [
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ]
+)
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", num_transformer, num_cols),
+        ("cat", cat_transformer, cat_cols),
+    ]
+)
 
-# Encode categorical variables
-encoder = OneHotEncoder(sparse_output = False, handle_unknown="ignore")
-encoder.set_output(transform="pandas")
-encoded_df_train = encoder.fit_transform(X_train[categorical_cols])
-X_train = X_train.drop(columns=categorical_cols).join(encoded_df_train)
-encoded_df_test = encoder.transform(X_test[categorical_cols])
-X_test = X_test.drop(columns = categorical_cols).join(encoded_df_test)
+# Build pipeline with model
+pipeline = Pipeline(
+    [("preprocessor", preprocessor), ("model", RandomForestRegressor())]
+)
 
-# Scale all variables to normalize
-scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_test = scaler.transform(X_test)
 
-# Train and fun model
-model = RandomForestRegressor()
-model.fit(X_train, y_train)
-predictions = model.predict(X_test)
+# Build cross validator
+cv = KFold(5, shuffle=True, random_state=1)
 
-# Evaluate model
-print(f"Predicted life expectancies are {predictions[:20]}")
-print(f"Actual life expectancies are: {y_test.to_numpy()[:20]}")
-mse = mean_squared_error(y_test, predictions)
-print(f"MSE: {mse}")
+baseline_scores = cross_val_score(
+    estimator=pipeline, X=X_train, y=y_train, cv=cv, scoring="r2"
+)
+print(f"Baseline model r-sqaure score: {baseline_scores.mean()}")
 
+param_dist = {
+    "model__n_estimators": [25, 50, 100, 200, 400],
+    "model__max_features": [1.0, "sqrt", 0.3, 0.5],
+    "model__max_depth": [None, 5, 10, 20, 40],
+    "model__min_samples_leaf": [1, 2, 4, 8],
+    "model__min_samples_split": [2, 4, 8, 16],
+}
+
+# Tune hyperparameters
+search = RandomizedSearchCV(
+    estimator=pipeline,
+    param_distributions=param_dist,
+    cv=cv,
+    n_iter=50,
+    scoring="r2",
+    n_jobs=-1,
+    random_state=1,
+    verbose=1,
+)
+
+# Find best model
+search.fit(X_train, y_train)
+print(f"best model has parameters: {search.best_params_}")
+print(f"best model returns score: {search.best_score_}")
+best_model = search.best_estimator_
+
+# Get final model evaluation
+predictions = best_model.predict(X_test)
+r2 = r2_score(y_test, predictions)
+print(f"Final r-squared on test data is: {r2}")
+
+# Feature importance analysis
+feature_names = best_model.named_steps["preprocessor"].get_feature_names_out()
+importances = best_model.named_steps["model"].feature_importances_
+
+importance_df = pd.DataFrame(
+    {"feature": feature_names, "importance": importances}
+).sort_values("importance", ascending=False)
+
+print("\nTop 20 feature importances:")
+print(importance_df.head(20))
